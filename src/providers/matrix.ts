@@ -100,8 +100,20 @@ export const getAuthMetadata = async (baseUrl: string, signal?: AbortSignal): Pr
   return null;
 };
 
+// One refresh shared by all callers: MAS rotates refresh tokens, so concurrent refreshes revoke each other's tokens.
+let ongoingRefresh: Promise<boolean> | null = null;
+
+export const refreshAccessToken = (): Promise<boolean> => {
+  if (!ongoingRefresh) {
+    ongoingRefresh = requestTokenRefresh().finally(() => {
+      ongoingRefresh = null;
+    });
+  }
+  return ongoingRefresh;
+};
+
 // Refreshes the access token; based on authts/oidc-client-ts docs/protocols/refresh-token-grant.md.
-export const refreshAccessToken = async (): Promise<boolean> => {
+const requestTokenRefresh = async (): Promise<boolean> => {
   const refreshToken = localStorage.getItem("refresh_token");
   const tokenEndpoint = localStorage.getItem("token_endpoint");
   const clientId = localStorage.getItem("clientId");
@@ -160,6 +172,39 @@ export const refreshAccessToken = async (): Promise<boolean> => {
     log.error("access token refresh failed", error);
     return false;
   }
+};
+
+// Ends an OAuth 2.0 API session by revoking its tokens (RFC 7009), as /logout fails there; false means use /logout.
+export const revokeOAuthTokens = async (): Promise<boolean> => {
+  const revocationEndpoint = localStorage.getItem("revocation_endpoint");
+  const clientId = localStorage.getItem("clientId");
+
+  if (!revocationEndpoint || !clientId) {
+    return false;
+  }
+
+  // Revokes both, as matrix-js-sdk does: an expired access token is a no-op, the refresh token ends the session.
+  const revoke = async (tokenType: "access_token" | "refresh_token") => {
+    const token = localStorage.getItem(tokenType);
+    if (!token) {
+      return;
+    }
+    try {
+      await fetchUtils.fetchJson(revocationEndpoint, {
+        method: "POST",
+        headers: new Headers({
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        }),
+        body: new URLSearchParams({ token, token_type_hint: tokenType, client_id: clientId }).toString(),
+      });
+    } catch (err) {
+      log.warn(`${tokenType} revocation failed`, err);
+    }
+  };
+
+  await Promise.all([revoke("access_token"), revoke("refresh_token")]);
+  return true;
 };
 
 interface ClientRegistration {
@@ -243,6 +288,11 @@ export const handleOIDCAuth = async (authMetadata: AuthMetadata, clientUrl: stri
 
   localStorage.setItem("clientId", clientId);
   localStorage.setItem("token_endpoint", authMetadata.token_endpoint);
+  if (authMetadata.revocation_endpoint) {
+    localStorage.setItem("revocation_endpoint", authMetadata.revocation_endpoint);
+  } else {
+    localStorage.removeItem("revocation_endpoint");
+  }
   let deviceId = localStorage.getItem("device_id");
   if (!deviceId) {
     deviceId = generateDeviceId();
